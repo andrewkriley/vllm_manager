@@ -176,6 +176,23 @@ Container (vllm-manager:latest)
 
 Each vLLM instance runs as a subprocess managed by the admin backend. GPU isolation is achieved via `CUDA_VISIBLE_DEVICES`. Ports are allocated from a pool (8001-8010 by default).
 
+### Two-host Ray cluster mode
+
+Optional second mode for a lab that already has Docker Ray on two hosts (fabric IPs, `run-cluster.sh`). The admin process **does not** take GPUs. It SSHs to head and worker, starts Ray, then `vllm serve` inside the head container with `--distributed-executor-backend ray`.
+
+```bash
+# On the head host, once a dedicated SSH key exists at ~/.ssh/vllm_manager_ed25519
+bash run-cluster-controller.sh
+# UI: http://<head-mgmt>:7080  — use “Start cluster replica”
+```
+
+| Endpoint | Role |
+|---|---|
+| `GET /api/cluster/config` | Whether cluster mode is enabled |
+| `GET /api/cluster/status` | Ray containers + vLLM state |
+| `POST /api/cluster/start` | Ensure Ray, then `vllm serve` on the head |
+| `POST /api/cluster/stop` | `{ "ray": false }` stops serve only; `true` also stops Ray |
+
 ## Project Structure
 
 ```
@@ -188,7 +205,8 @@ Each vLLM instance runs as a subprocess managed by the admin backend. GPU isolat
 ├── admin/
 │   ├── __init__.py
 │   ├── app.py             # FastAPI backend
-│   ├── vllm_manager.py    # vLLM process lifecycle manager
+│   ├── vllm_manager.py    # local vLLM subprocess lifecycle
+│   ├── cluster_manager.py # two-host Docker Ray + vllm serve on head
 │   └── static/
 │       └── index.html     # Single-page admin UI
 ├── README.md

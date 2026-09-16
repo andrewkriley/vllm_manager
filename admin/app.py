@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
+from admin.cluster_manager import ClusterManager, ClusterState
 from admin.vllm_manager import State, VllmConfig, VllmManager
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,7 @@ _download_state = {
 }
 
 MODELS_DIR = Path(os.getenv("MODELS_DIR", "/models"))
+_cluster = ClusterManager()
 
 ALLOWED_DTYPES = {"auto", "float16", "bfloat16", "float32"}
 ALLOWED_MODEL_IMPLS = {"auto", "transformers", "vllm"}
@@ -195,9 +197,78 @@ def api_model_info(model_name: str):
 @app.get("/api/status")
 def api_status():
     instances = []
+    if _cluster.settings.enabled and _cluster.state not in {
+        ClusterState.DISABLED,
+        ClusterState.STOPPED,
+    }:
+        instances.append(_cluster.get_status())
     for iid, inst in _instances.items():
         instances.append(inst.get_status())
     return {"instances": instances}
+
+
+@app.get("/api/cluster/config")
+def api_cluster_config():
+    return _cluster.public_config()
+
+
+@app.get("/api/cluster/status")
+async def api_cluster_status():
+    status = _cluster.get_status()
+    status["ray"] = await _cluster.ray_snapshot()
+    return status
+
+
+class ClusterStartRequest(BaseModel):
+    model: str
+    tensor_parallel_size: int = 4
+    pipeline_parallel_size: int = 2
+    gpu_memory_utilization: float = 0.90
+    served_model_name: Optional[str] = None
+    extra_args: str = ""
+    trust_remote_code: bool = True
+
+
+@app.post("/api/cluster/start")
+async def api_cluster_start(req: ClusterStartRequest):
+    if not _cluster.settings.enabled:
+        return JSONResponse(status_code=400, content={"error": "CLUSTER_ENABLED is not set"})
+    extra_args = []
+    if req.extra_args.strip():
+        try:
+            extra_args = shlex.split(req.extra_args)
+        except ValueError as e:
+            return JSONResponse(status_code=400, content={"error": f"Invalid extra args: {e}"})
+    model_path = _safe_model_path(req.model)
+    model = str(model_path) if model_path and model_path.is_dir() else req.model
+    try:
+        await _cluster.start_serve(
+            model=model if model.startswith("/") else req.model,
+            tensor_parallel_size=req.tensor_parallel_size,
+            pipeline_parallel_size=req.pipeline_parallel_size,
+            gpu_memory_utilization=req.gpu_memory_utilization,
+            served_model_name=req.served_model_name or None,
+            extra_args=extra_args,
+            trust_remote_code=req.trust_remote_code,
+        )
+    except RuntimeError as e:
+        return JSONResponse(status_code=409, content={"error": str(e)})
+    return {"status": _cluster.state.value, "id": "cluster-ray", "port": _cluster.settings.serve_port}
+
+
+class ClusterStopRequest(BaseModel):
+    ray: bool = False
+
+
+@app.post("/api/cluster/stop")
+async def api_cluster_stop(req: ClusterStopRequest):
+    if not _cluster.settings.enabled:
+        return JSONResponse(status_code=400, content={"error": "CLUSTER_ENABLED is not set"})
+    if req.ray:
+        await _cluster.stop_ray()
+    else:
+        await _cluster.stop_serve()
+    return {"status": _cluster.state.value, "instance_id": "cluster-ray"}
 
 
 class StartRequest(BaseModel):

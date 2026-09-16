@@ -321,6 +321,37 @@
     </div>
   </div>
 
+  <!-- Two-host Ray cluster -->
+  <div class="card full-width" id="cluster-card" style="display:none">
+    <h2>Two-host Ray cluster</h2>
+    <p style="font-size:0.9rem;color:var(--text-secondary);margin-bottom:12px">
+      Starts Docker Ray on both GPU hosts (fabric IPs), then <code>vllm serve</code> on the head.
+      Does not use <code>CUDA_VISIBLE_DEVICES</code> in this admin process.
+    </p>
+    <pre id="cluster-ray-status" style="background:var(--bg-logs);padding:10px;border-radius:6px;font-size:0.78rem;max-height:140px;overflow:auto;color:var(--log-text)">Loading cluster…</pre>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
+      <div>
+        <label>Tensor parallel</label>
+        <input type="number" id="cluster-tp" value="4" min="1" max="8">
+      </div>
+      <div>
+        <label>Pipeline parallel</label>
+        <input type="number" id="cluster-pp" value="2" min="1" max="8">
+      </div>
+      <div>
+        <label>GPU memory util</label>
+        <input type="number" id="cluster-mem" value="0.90" min="0.1" max="1" step="0.05">
+      </div>
+    </div>
+    <label>Served name (optional)</label>
+    <input type="text" id="cluster-served-name" placeholder="e.g. Qwen/Qwen2.5-72B-Instruct">
+    <div class="btn-row">
+      <button class="btn-start" id="btn-cluster-start" onclick="startCluster()">Start cluster replica</button>
+      <button class="btn-stop" id="btn-cluster-stop-serve" onclick="stopCluster(false)">Stop vLLM</button>
+      <button class="btn-stop" id="btn-cluster-stop-ray" onclick="stopCluster(true)">Stop Ray</button>
+    </div>
+  </div>
+
   <!-- Download Model -->
   <div class="card full-width">
     <h2>Download Model from HuggingFace</h2>
@@ -753,10 +784,12 @@ async function startVllm() {
 async function stopInstance(instanceId) {
   if (!(await showModal('Stop Instance', 'Stop instance ' + instanceId + '?'))) return;
   try {
-    const res = await fetch('/api/stop', {
+    const url = instanceId === 'cluster-ray' ? '/api/cluster/stop' : '/api/stop';
+    const body = instanceId === 'cluster-ray' ? { ray: false } : { instance_id: instanceId };
+    const res = await fetch(url, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ instance_id: instanceId }),
+      body: JSON.stringify(body),
     });
     const data = await res.json();
     if (!res.ok) showToast(data.error || 'Failed to stop', 'error');
@@ -789,7 +822,7 @@ async function pollStatus() {
     listEl.innerHTML = instances.map(s => {
       const model = s.model ? s.model.split('/').pop() : '?';
       const gpus = (s.gpu_ids || []).join(', ');
-      const apiUrl = s.port ? 'http://' + window.location.hostname + ':' + s.port : '';
+      const apiUrl = s.public_api || (s.port ? 'http://' + window.location.hostname + ':' + s.port : '');
       const selected = s.id === selectedLogInstance ? ' selected' : '';
       const cmdLine = s.cmd ? `<div class="cmd-line"><span class="cmd-label">CUDA_VISIBLE_DEVICES=${s.cuda_visible_devices || ''}</span> ${s.cmd}</div>` : '';
       return `
@@ -799,6 +832,7 @@ async function pollStatus() {
             <div class="inst-info">
               <span><b>${s.id}</b></span>
               <span><span class="inst-label">Model:</span> ${model}</span>
+              ${s.kind === 'cluster' ? `<span><span class="inst-label">Kind:</span> two-host Ray</span>` : ''}
               <span><span class="inst-label">GPUs:</span> ${gpus}</span>
               ${apiUrl ? `<span><span class="inst-label">API:</span> ${apiUrl}</span>` : ''}
               <span><span class="inst-label">dtype:</span> ${s.dtype || 'auto'}</span>
@@ -1112,13 +1146,88 @@ $('mem-util').addEventListener('input', function() {
   $('mem-util-val').textContent = parseFloat(this.value).toFixed(2);
 });
 
+async function refreshClusterCard() {
+  try {
+    const cfgRes = await fetch('/api/cluster/config');
+    const cfg = await cfgRes.json();
+    const card = $('cluster-card');
+    if (!cfg.enabled) {
+      card.style.display = 'none';
+      return;
+    }
+    card.style.display = 'block';
+    const stRes = await fetch('/api/cluster/status');
+    const st = await stRes.json();
+    const ray = (st.ray && st.ray.ray_status) ? st.ray.ray_status : '';
+    $('cluster-ray-status').textContent =
+      'state: ' + st.state +
+      (st.error ? '\nerror: ' + st.error : '') +
+      '\nhead: ' + ((st.ray && st.ray.head_container) || 'down') +
+      '\nworker: ' + ((st.ray && st.ray.worker_container) || 'down') +
+      (ray ? '\n' + ray : '');
+  } catch (e) {
+    $('cluster-card').style.display = 'none';
+  }
+}
+
+async function startCluster() {
+  const model = $('model-select').value;
+  if (!model) { showToast('Select a model', 'warning'); return; }
+  $('btn-cluster-start').disabled = true;
+  try {
+    const res = await fetch('/api/cluster/start', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        model: model,
+        tensor_parallel_size: parseInt($('cluster-tp').value) || 4,
+        pipeline_parallel_size: parseInt($('cluster-pp').value) || 2,
+        gpu_memory_utilization: parseFloat($('cluster-mem').value) || 0.90,
+        served_model_name: $('cluster-served-name').value.trim() || null,
+        extra_args: $('extra-args').value.trim(),
+        trust_remote_code: true,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) showToast(data.error || 'Cluster start failed', 'error');
+    else {
+      showToast('Cluster replica starting', 'success');
+      selectedLogInstance = 'cluster-ray';
+    }
+  } catch (e) {
+    showToast('Request failed: ' + e.message, 'error');
+  }
+  $('btn-cluster-start').disabled = false;
+  refreshClusterCard();
+}
+
+async function stopCluster(ray) {
+  const msg = ray ? 'Stop vLLM and the two-host Ray cluster?' : 'Stop vLLM on the head (leave Ray up)?';
+  if (!(await showModal('Stop cluster', msg))) return;
+  try {
+    const res = await fetch('/api/cluster/stop', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ ray: !!ray }),
+    });
+    const data = await res.json();
+    if (!res.ok) showToast(data.error || 'Stop failed', 'error');
+    else showToast(ray ? 'Ray cluster stopped' : 'vLLM stopped', 'success');
+  } catch (e) {
+    showToast('Request failed: ' + e.message, 'error');
+  }
+  refreshClusterCard();
+}
+
 // Init
 loadGpus();
 loadModels();
 pollStatus();
 pollDownload();
+refreshClusterCard();
 setInterval(pollStatus, 3000);
 setInterval(pollDownload, 3000);
+setInterval(refreshClusterCard, 4000);
 </script>
 </body>
 </html>
