@@ -2,7 +2,7 @@
 
 ## High Priority
 
-- [ ] HuggingFace token support for gated/private models (pass `HF_TOKEN` env var)
+- [x] HuggingFace token support (UI field + `HF_TOKEN`/`HF_API` env, never logged)
 - [ ] Concurrent model downloads (currently limited to one at a time)
 - [ ] Auto-restart instances on crash (configurable)
 - [ ] Persist instance configurations across container restarts

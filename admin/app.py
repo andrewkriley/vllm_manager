@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -27,6 +28,7 @@ _used_gpus: set[int] = set()
 # Download state
 _download_state = {
     "status": "idle",  # idle, downloading, complete, error
+    "phase": None,
     "repo_id": None,
     "error": None,
     "downloaded_bytes": 0,
@@ -35,6 +37,11 @@ _download_state = {
 
 MODELS_DIR = Path(os.getenv("MODELS_DIR", "/models"))
 _cluster = ClusterManager()
+
+
+@app.on_event("startup")
+async def _recover_cluster() -> None:
+    await _cluster.recover()
 
 ALLOWED_DTYPES = {"auto", "float16", "bfloat16", "float32"}
 ALLOWED_MODEL_IMPLS = {"auto", "transformers", "vllm"}
@@ -66,6 +73,7 @@ def _on_instance_exit(instance_id: str) -> None:
 
 
 def get_gpus() -> list[dict]:
+    """Local NVML probe. Cluster mode uses SSH nvidia-smi instead."""
     try:
         import pynvml
         pynvml.nvmlInit()
@@ -100,8 +108,12 @@ def get_gpus() -> list[dict]:
             })
         pynvml.nvmlShutdown()
         return gpus
+    except ImportError:
+        logger.info("pynvml not installed; expected for the GPU-less cluster controller")
+        return []
     except Exception as e:
-        return [{"error": str(e)}]
+        logger.warning("local GPU probe failed: %s", e)
+        return []
 
 
 def list_models() -> list[str]:
@@ -120,7 +132,12 @@ def list_models() -> list[str]:
 
 
 @app.get("/api/gpus")
-def api_gpus():
+async def api_gpus():
+    if _cluster.settings.enabled:
+        await _cluster.recover()
+        remote = await _cluster.list_gpus()
+        if remote:
+            return remote
     return get_gpus()
 
 
@@ -195,7 +212,9 @@ def api_model_info(model_name: str):
 
 
 @app.get("/api/status")
-def api_status():
+async def api_status():
+    if _cluster.settings.enabled:
+        await _cluster.recover()
     instances = []
     if _cluster.settings.enabled and _cluster.state not in {
         ClusterState.DISABLED,
@@ -219,6 +238,7 @@ def api_cluster_config():
 
 @app.get("/api/cluster/status")
 async def api_cluster_status():
+    await _cluster.recover()
     status = _cluster.get_status()
     status["ray"] = await _cluster.ray_snapshot()
     return status
@@ -333,6 +353,46 @@ async def api_start(req: StartRequest):
     model_path = _safe_model_path(req.model)
     if not model_path or not model_path.is_dir():
         return JSONResponse(status_code=400, content={"error": "Invalid model name"})
+
+    extra_args = []
+    if req.extra_args.strip():
+        try:
+            extra_args = shlex.split(req.extra_args)
+        except ValueError as e:
+            return JSONResponse(status_code=400, content={"error": f"Invalid extra args: {e}"})
+
+    if _cluster.settings.enabled:
+        await _cluster.recover()
+        if req.max_model_len is not None:
+            extra_args.extend(["--max-model-len", str(req.max_model_len)])
+        if req.dtype != "auto":
+            extra_args.extend(["--dtype", req.dtype])
+        if req.model_impl != "auto":
+            extra_args.extend(["--model-impl", req.model_impl])
+        if req.language_model_only:
+            extra_args.append("--language-model-only")
+        if req.enable_tool_use:
+            extra_args.append("--enable-auto-tool-choice")
+            if req.tool_call_parser:
+                extra_args.extend(["--tool-call-parser", req.tool_call_parser])
+        try:
+            await _cluster.start_serve(
+                model=str(model_path),
+                tensor_parallel_size=len(req.gpu_ids) // req.pipeline_parallel_size,
+                pipeline_parallel_size=req.pipeline_parallel_size,
+                gpu_memory_utilization=req.gpu_memory_utilization,
+                served_model_name=req.served_model_name or None,
+                extra_args=extra_args,
+                trust_remote_code=True,
+                gpu_ids=req.gpu_ids,
+            )
+        except RuntimeError as e:
+            return JSONResponse(status_code=409, content={"error": str(e)})
+        return {
+            "status": _cluster.state.value,
+            "id": "cluster-ray",
+            "port": _cluster.settings.serve_port,
+        }
 
     # Check GPU conflicts
     overlap = set(req.gpu_ids) & _used_gpus
@@ -470,9 +530,25 @@ def api_delete_model(req: DeleteModelRequest):
 
 class DownloadRequest(BaseModel):
     repo_id: str
+    token: Optional[str] = None
+    sync_to_worker: bool = True
 
 
-def _do_download(repo_id: str) -> None:
+def _hf_token(explicit: Optional[str] = None) -> Optional[str]:
+    """Resolve a HuggingFace token without logging it."""
+    for raw in (explicit, os.getenv("HF_TOKEN"), os.getenv("HF_API")):
+        if raw and raw.strip():
+            return raw.strip()
+    return None
+
+
+def _redact_token(message: str, token: Optional[str]) -> str:
+    if token and token in message:
+        return message.replace(token, "***")
+    return message
+
+
+def _do_download(repo_id: str, token: Optional[str]) -> None:
     """Blocking download — runs in a thread via asyncio."""
     from huggingface_hub import snapshot_download
     from tqdm.auto import tqdm as tqdm_auto
@@ -494,29 +570,46 @@ def _do_download(repo_id: str) -> None:
     if not local_dir:
         raise ValueError(f"Invalid repo ID: {repo_id}")
 
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
     snapshot_download(
         repo_id,
         local_dir=str(local_dir),
-        local_dir_use_symlinks=False,
+        token=token,
+        resume_download=True,
+        max_workers=16,
         tqdm_class=DownloadProgress,
     )
 
 
-async def _run_download(repo_id: str) -> None:
+async def _run_download(repo_id: str, token: Optional[str], sync_to_worker: bool) -> None:
     _download_state["status"] = "downloading"
     _download_state["repo_id"] = repo_id
     _download_state["error"] = None
+    _download_state["phase"] = "huggingface"
     _download_state["downloaded_bytes"] = 0
     _download_state["total_bytes"] = 0
     try:
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _do_download, repo_id)
+        await loop.run_in_executor(None, _do_download, repo_id, token)
+        local_name = repo_id.split("/")[-1]
+        if sync_to_worker and _cluster.settings.enabled:
+            _download_state["phase"] = "sync_worker"
+            await _cluster.sync_model_to_worker(local_name)
         _download_state["status"] = "complete"
+        _download_state["phase"] = "done"
         logger.info("Download complete: %s", repo_id)
     except Exception as e:
         _download_state["status"] = "error"
-        _download_state["error"] = str(e)
-        logger.error("Download failed: %s", e)
+        _download_state["error"] = _redact_token(str(e), token)
+        logger.error("Download failed: %s", _redact_token(str(e), token))
+
+
+@app.get("/api/download/config")
+def api_download_config():
+    return {
+        "has_server_token": bool(_hf_token()),
+        "cluster_sync": _cluster.settings.enabled,
+    }
 
 
 @app.post("/api/download")
@@ -526,8 +619,14 @@ async def api_download(req: DownloadRequest):
             status_code=409,
             content={"error": f"Already downloading {_download_state['repo_id']}"},
         )
-    asyncio.create_task(_run_download(req.repo_id))
-    return {"status": "downloading", "repo_id": req.repo_id}
+    token = _hf_token(req.token)
+    asyncio.create_task(_run_download(req.repo_id, token, req.sync_to_worker))
+    return {
+        "status": "downloading",
+        "repo_id": req.repo_id,
+        "using_token": bool(token),
+        "sync_to_worker": bool(req.sync_to_worker and _cluster.settings.enabled),
+    }
 
 
 @app.get("/api/download/status")
@@ -545,14 +644,25 @@ class ChatRequest(BaseModel):
 
 @app.post("/api/chat")
 async def api_chat(req: ChatRequest):
-    mgr = _instances.get(req.instance_id)
-    if not mgr:
-        return JSONResponse(status_code=404, content={"error": "Instance not found"})
-    if mgr.state != State.RUNNING:
-        return JSONResponse(status_code=409, content={"error": f"Instance is {mgr.state.value}, not running"})
-
-    port = mgr.config.port
-    model = mgr.config.served_model_name or mgr.config.model
+    if req.instance_id == "cluster-ray":
+        if _cluster.state != ClusterState.RUNNING:
+            return JSONResponse(
+                status_code=409,
+                content={"error": f"Cluster is {_cluster.state.value}, not running"},
+            )
+        chat_url = _cluster.settings.health_url.rstrip("/") + "/v1/chat/completions"
+        model = _cluster.served_model_name or _cluster.model or ""
+    else:
+        mgr = _instances.get(req.instance_id)
+        if not mgr:
+            return JSONResponse(status_code=404, content={"error": "Instance not found"})
+        if mgr.state != State.RUNNING:
+            return JSONResponse(
+                status_code=409,
+                content={"error": f"Instance is {mgr.state.value}, not running"},
+            )
+        chat_url = f"http://localhost:{mgr.config.port}/v1/chat/completions"
+        model = mgr.config.served_model_name or mgr.config.model
 
     payload = {
         "model": model,
@@ -563,13 +673,9 @@ async def api_chat(req: ChatRequest):
     if req.tools:
         payload["tools"] = req.tools
 
-    import httpx
     async with httpx.AsyncClient(timeout=120) as client:
         try:
-            resp = await client.post(
-                f"http://localhost:{port}/v1/chat/completions",
-                json=payload,
-            )
+            resp = await client.post(chat_url, json=payload)
             return JSONResponse(content=resp.json(), status_code=resp.status_code)
         except httpx.RequestError as e:
             return JSONResponse(status_code=502, content={"error": f"Failed to reach vLLM: {e}"})

@@ -12,6 +12,10 @@ MODELS="${VLLM_MODELS_DIR:-/models}"
 HF_CACHE="${VLLM_HF_CACHE:-${MODELS}/hf-cache}"
 RAY_PORT="${RAY_PORT:-6379}"
 NUM_GPUS="${NUM_GPUS:-}"
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+  IFS=',' read -r -a _cuda_devs <<< "${CUDA_VISIBLE_DEVICES}"
+  NUM_GPUS="${#_cuda_devs[@]}"
+fi
 if [ -z "$NUM_GPUS" ]; then
   NUM_GPUS="$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')"
 fi
@@ -56,6 +60,9 @@ RUN_ARGS=(
   -v "${HF_CACHE}:/root/.cache/huggingface"
   -e "VLLM_HOST_IP=${HOST_IP}"
 )
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+  RUN_ARGS+=(-e "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}")
+fi
 
 if [ "${CLUSTER_PRIVILEGED:-true}" = "true" ]; then
   RUN_ARGS+=(--privileged)

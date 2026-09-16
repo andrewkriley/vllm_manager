@@ -43,7 +43,7 @@ docker run -d \
   --restart unless-stopped \
   --add-host=host.docker.internal:host-gateway \
   -p "${ADMIN_PORT}:7080" \
-  -v "${MODELS_DIR}:/models:ro" \
+  -v "${MODELS_DIR}:/models" \
   -v "${SSH_KEY}:/keys/vllm_manager_ed25519:ro" \
   -e CLUSTER_ENABLED=true \
   -e CLUSTER_SSH_USER="${CLUSTER_SSH_USER}" \
@@ -61,6 +61,7 @@ docker run -d \
   -e NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX}" \
   -e NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-}" \
   -e CLUSTER_RESTRICT_FABRIC="${CLUSTER_RESTRICT_FABRIC}" \
+  -e HF_TOKEN="${HF_TOKEN:-${HF_API:-}}" \
   -e MODELS_DIR=/models \
   "$IMAGE_NAME"
 

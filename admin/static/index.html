@@ -241,6 +241,9 @@
       <button class="btn-refresh" onclick="loadGpus()">Refresh</button>
     </div>
     <div class="warning" id="gpu-warning"></div>
+    <p id="gpu-select-hint" style="font-size:0.85rem;color:var(--text-secondary);margin:0 0 10px">
+      Tick GPUs, then Start Instance. In cluster mode this starts the two-host Ray replica (serve runs on the head).
+    </p>
     <div class="gpu-list" id="gpu-list">Loading...</div>
   </div>
 
@@ -359,13 +362,23 @@
   <!-- Download Model -->
   <div class="card full-width">
     <h2>Download Model from HuggingFace</h2>
-    <div style="display:flex;gap:10px;align-items:end">
-      <div style="flex:1">
+    <p style="font-size:0.85rem;color:var(--text-secondary);margin:0 0 10px">
+      Authenticated downloads are faster and required for gated models such as
+      <code>meta-llama/Llama-3.1-405B-Instruct</code>. Paste a token for this download only; it is not saved.
+      Accept the model license on HuggingFace first. In cluster mode the snapshot is copied to the worker after download.
+    </p>
+    <div style="display:flex;gap:10px;align-items:end;flex-wrap:wrap">
+      <div style="flex:1;min-width:240px">
         <label style="margin-top:0">HuggingFace Repo ID</label>
-        <input type="text" id="hf-repo" placeholder="e.g. TinyLlama/TinyLlama-1.1B-Chat-v1.0">
+        <input type="text" id="hf-repo" placeholder="e.g. meta-llama/Llama-3.1-405B-Instruct" autocomplete="off">
+      </div>
+      <div style="flex:1;min-width:240px">
+        <label style="margin-top:0">HF API token (optional)</label>
+        <input type="password" id="hf-token" placeholder="hf_…  (or set HF_TOKEN on the server)" autocomplete="off">
       </div>
       <button class="btn-download" id="btn-download" onclick="downloadModel()">Download</button>
     </div>
+    <div id="hf-token-hint" style="font-size:0.8rem;color:var(--text-secondary);margin-top:6px"></div>
     <div class="progress-wrap" id="progress-wrap">
       <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
       <div class="progress-text" id="progress-text"></div>
@@ -514,29 +527,65 @@ async function loadGpus() {
 
 function renderGpus() {
   const list = $('gpu-list');
-  if (gpuData.length && gpuData[0].error) {
+  const previouslyChecked = new Set(
+    [...document.querySelectorAll('#gpu-list input[type="checkbox"]:checked')].map(cb => cb.value)
+  );
+  if (!gpuData.length) {
+    list.innerHTML = '<div style="color:var(--text-muted)">No GPUs reported. Cluster mode reads nvidia-smi over SSH, not pynvml in this container.</div>';
+    return;
+  }
+  if (gpuData.length === 1 && gpuData[0].error && gpuData[0].memory_total_mb == null) {
     const errDiv = document.createElement('div');
     errDiv.style.color = '#f44';
     errDiv.textContent = 'Error: ' + gpuData[0].error;
     list.replaceChildren(errDiv);
     return;
   }
+  const cluster = gpuData.some(g => g.source === 'cluster');
+  const freeCount = gpuData.filter(g => !g.in_use).length;
+  const hint = $('gpu-select-hint');
+  if (hint && cluster) {
+    hint.textContent = freeCount
+      ? 'Tick GPUs, set Pipeline Parallel if needed (2 hosts / 8 GPUs → PP=2, TP=4), then Start Instance. Serve always runs on the head.'
+      : 'All GPUs are in use by the running replica. Stop that instance, then tick GPUs and Start Instance.';
+  }
   list.innerHTML = gpuData.map(g => {
     const inUse = g.in_use;
     const disabled = inUse ? 'disabled' : '';
+    const checked = (!inUse && previouslyChecked.has(String(g.index))) ? 'checked' : '';
     const cls = inUse ? 'gpu-item in-use' : 'gpu-item';
     const usedLabel = g.used_by ? `<span class="gpu-used">(${g.used_by})</span>` : '';
+    const host = g.role ? `${g.role} ` : '';
+    const role = g.role || '';
     return `
       <label class="${cls}">
-        <input type="checkbox" value="${g.index}" data-cc="${g.compute_capability}" ${disabled} onchange="updatePpPartition()">
-        <span class="gpu-name">GPU ${g.index}: ${g.name}</span>
+        <input type="checkbox" value="${g.index}" data-cc="${g.compute_capability}" data-role="${role}" ${disabled} ${checked} onchange="onGpuSelectionChange()">
+        <span class="gpu-name">${host}GPU ${g.local_index != null ? g.local_index : g.index}: ${g.name}</span>
         ${usedLabel}
         <span class="gpu-cc">CC ${g.compute_capability}</span>
-        <span class="gpu-mem">${g.memory_free_mb} / ${g.memory_total_mb} MB free</span>
+        <span class="gpu-mem">${g.memory_used_mb || (g.memory_total_mb - g.memory_free_mb)} / ${g.memory_total_mb} MB used</span>
       </label>
     `;
   }).join('');
   list.querySelectorAll('input:not(:disabled)').forEach(cb => cb.addEventListener('change', checkMixedArch));
+}
+
+function onGpuSelectionChange() {
+  checkMixedArch();
+  updatePpPartition();
+  const checked = [...document.querySelectorAll('#gpu-list input:checked')];
+  const warn = $('gpu-warning');
+  if (!checked.length) return;
+  const roles = new Set(checked.map(cb => cb.dataset.role).filter(Boolean));
+  const pp = parseInt($('pp-size').value) || 1;
+  const tp = Math.max(1, Math.floor(checked.length / pp));
+  if ($('cluster-tp')) $('cluster-tp').value = tp;
+  if ($('cluster-pp')) $('cluster-pp').value = pp;
+  if ($('cluster-mem')) $('cluster-mem').value = $('mem-util').value;
+  if (roles.size === 2 && pp === 1) {
+    warn.textContent = 'Two hosts selected with Pipeline Parallel = 1 (TP=' + checked.length + '). For the usual 4+4 layout set Pipeline Parallel Size to 2.';
+    warn.style.display = 'block';
+  }
 }
 
 function checkMixedArch() {
@@ -565,7 +614,7 @@ function updateGpuHistory() {
 
 function renderGpuCharts() {
   const container = $('gpu-charts');
-  if (!gpuData.length || gpuData[0].error) {
+  if (!gpuData.length || (gpuData.length === 1 && gpuData[0].error && gpuData[0].memory_total_mb == null)) {
     container.innerHTML = '<div style="color:var(--text-muted);font-size:0.85rem">No GPU data</div>';
     return;
   }
@@ -743,7 +792,15 @@ async function updatePpPartition() {
 // --- Instance management ---
 async function startVllm() {
   const gpuIds = [...document.querySelectorAll('#gpu-list input:checked')].map(cb => parseInt(cb.value));
-  if (gpuIds.length === 0) { showToast('Select at least one GPU', 'warning'); return; }
+  if (gpuIds.length === 0) {
+    const free = document.querySelectorAll('#gpu-list input[type="checkbox"]:not(:disabled)');
+    if (!free.length) {
+      showToast('All GPUs are in use. Stop the running instance first, then select GPUs.', 'warning');
+    } else {
+      showToast('Select at least one GPU', 'warning');
+    }
+    return;
+  }
   const model = $('model-select').value;
   if (!model) { showToast('Select a model', 'warning'); return; }
 
@@ -869,7 +926,6 @@ async function pollStatus() {
     }
 
     updateChatInstances(instances);
-    loadGpus();
   } catch (e) {}
 }
 
@@ -921,21 +977,41 @@ function downloadLogs() {
 async function downloadModel() {
   const repo = $('hf-repo').value.trim();
   if (!repo) { showToast('Enter a HuggingFace repo ID', 'warning'); return; }
+  const token = $('hf-token').value.trim();
   $('btn-download').disabled = true;
   try {
+    const body = { repo_id: repo, sync_to_worker: true };
+    if (token) body.token = token;
     const res = await fetch('/api/download', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ repo_id: repo }),
+      body: JSON.stringify(body),
     });
     const data = await res.json();
     if (!res.ok) showToast(data.error || 'Failed to start download', 'error');
+    else {
+      showToast(data.using_token ? 'Download started (authenticated)' : 'Download started (anonymous — slower, gated models will fail)', data.using_token ? 'success' : 'warning');
+      $('hf-token').value = '';
+    }
   } catch (e) {
     showToast('Request failed: ' + e.message, 'error');
     $('btn-download').disabled = false;
   }
 }
 
+async function loadDownloadConfig() {
+  try {
+    const res = await fetch('/api/download/config');
+    const d = await res.json();
+    const hint = $('hf-token-hint');
+    if (!hint) return;
+    const bits = [];
+    if (d.has_server_token) bits.push('Server already has HF_TOKEN/HF_API — leave the field blank to use it.');
+    else bits.push('No server token configured. Paste a token for gated or faster downloads.');
+    if (d.cluster_sync) bits.push('After download, the snapshot is copied to the worker host.');
+    hint.textContent = bits.join(' ');
+  } catch (e) {}
+}
 let _lastDlStatus = '';
 let _lastDlBytes = 0;
 let _lastDlTime = 0;
@@ -962,7 +1038,8 @@ async function pollDownload() {
       wrap.style.display = 'none';
       $('btn-download').disabled = false;
     } else if (d.status === 'downloading') {
-      el.textContent = 'Downloading ' + d.repo_id + '...';
+      const phase = d.phase === 'sync_worker' ? 'Copying to worker host… ' : 'Downloading ';
+      el.textContent = phase + d.repo_id + '...';
       $('btn-download').disabled = true;
       if (d.total_bytes > 0) {
         const pct = Math.min(100, (d.downloaded_bytes / d.total_bytes * 100));
@@ -1232,11 +1309,13 @@ async function stopCluster(ray) {
 // Init
 loadGpus();
 loadModels();
+loadDownloadConfig();
 pollStatus();
 pollDownload();
 refreshClusterCard();
 setInterval(pollStatus, 3000);
 setInterval(pollDownload, 3000);
+setInterval(loadGpus, 4000);
 setInterval(refreshClusterCard, 4000);
 </script>
 </body>

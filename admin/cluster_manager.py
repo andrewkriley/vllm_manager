@@ -7,9 +7,11 @@ in the admin process.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shlex
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -83,9 +85,12 @@ class ClusterManager:
         self.tensor_parallel_size: int = 4
         self.pipeline_parallel_size: int = 2
         self.gpu_memory_utilization: float = 0.90
+        self.gpu_ids: list[int] = []
         self.cmd: Optional[str] = None
         self._log_task: Optional[asyncio.Task] = None
         self._health_task: Optional[asyncio.Task] = None
+        self._gpu_cache: list[dict] = []
+        self._gpu_cache_at: float = 0.0
 
     def _append_log(self, line: str) -> None:
         line = line.rstrip()
@@ -144,7 +149,7 @@ class ClusterManager:
             return f"bash {path}"
         return f"bash {shlex.quote(path)}"
 
-    def _node_exports(self) -> str:
+    def _node_exports(self, extra: Optional[dict[str, str]] = None) -> str:
         s = self.settings
         vals = {
             "VLLM_HEAD_IP": s.head_fabric,
@@ -159,7 +164,9 @@ class ClusterManager:
             "FABRIC_CIDR": s.fabric_cidr,
             "NUM_GPUS": s.num_gpus,
         }
-        return " ".join(f"{k}={shlex.quote(v)}" for k, v in vals.items() if v)
+        if extra:
+            vals.update(extra)
+        return " ".join(f"{k}={shlex.quote(str(v))}" for k, v in vals.items() if v)
 
     def public_config(self) -> dict:
         s = self.settings
@@ -190,8 +197,8 @@ class ClusterManager:
             "error": self.error,
             "model": self.model,
             "served_model_name": self.served_model_name,
-            "gpu_ids": [0, 1, 2, 3, 4, 5, 6, 7] if self.state in {
-                ClusterState.STARTING_VLLM, ClusterState.RUNNING,
+            "gpu_ids": self.gpu_ids if self.state in {
+                ClusterState.STARTING_RAY, ClusterState.STARTING_VLLM, ClusterState.RUNNING,
             } else [],
             "port": self.settings.serve_port,
             "public_api": self.settings.public_api,
@@ -200,7 +207,7 @@ class ClusterManager:
             "tensor_parallel_size": self.tensor_parallel_size,
             "pipeline_parallel_size": self.pipeline_parallel_size,
             "cmd": self.cmd,
-            "cuda_visible_devices": "cluster (fabric Ray, not CUDA_VISIBLE_DEVICES)",
+            "cuda_visible_devices": ",".join(str(i) for i in self.gpu_ids) if self.gpu_ids else "cluster (all visible Ray GPUs)",
             "logs": self.logs[-100:],
             "head_host": self.settings.head_host,
             "worker_host": self.settings.worker_host,
@@ -227,18 +234,127 @@ class ClusterManager:
             "ray_status": ray_txt.strip()[-2000:],
         }
 
-    async def ensure_ray(self) -> None:
+    async def _vllm_is_healthy(self) -> bool:
+        port = self.settings.serve_port
+        code, out = await self._head(
+            f"curl -sS -m 3 -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{port}/health"
+        )
+        if code == 0 and out.strip() == "200":
+            return True
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                resp = await client.get(self.settings.health_url.rstrip("/") + "/health")
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    async def _adopt_running(self) -> None:
+        self.state = ClusterState.RUNNING
+        self.error = None
+        models_url = self.settings.health_url.rstrip("/") + "/v1/models"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                models = await client.get(models_url)
+            data = (models.json() or {}).get("data") or []
+            if data:
+                self.model = data[0].get("id")
+                self.served_model_name = data[0].get("id")
+        except Exception:
+            _, out = await self._head(
+                "curl -sS -m 5 http://127.0.0.1:8000/v1/models"
+            )
+            try:
+                data = (json.loads(out) or {}).get("data") or []
+                if data:
+                    self.model = data[0].get("id")
+                    self.served_model_name = data[0].get("id")
+            except Exception:
+                pass
+        inventory = await self.list_gpus()
+        if inventory and not self.gpu_ids:
+            self.gpu_ids = [g["index"] for g in inventory]
+        self._gpu_cache_at = 0.0
+        self._append_log(f"recovered running cluster model={self.model}")
+
+    async def recover(self) -> None:
+        """Adopt a cluster that is already serving after the controller restarts."""
+        if not self.settings.enabled:
+            return
+        if self.state == ClusterState.RUNNING:
+            return
+        if await self._vllm_is_healthy():
+            await self._adopt_running()
+            return
+        snap = await self.ray_snapshot()
+        if snap.get("head_container") or snap.get("worker_container"):
+            self._append_log(
+                "Ray containers are up; vLLM health was not ready "
+                f"head={snap.get('head_container')!r} worker={snap.get('worker_container')!r}"
+            )
+
+    def _cuda_extra(self, local_ids: Optional[list[int]], role: str) -> Optional[dict[str, str]]:
+        if not local_ids:
+            return None
+        total = sum(1 for g in self._gpu_cache if g.get("role") == role)
+        if total and sorted(local_ids) == list(range(total)):
+            return None
+        return {
+            "CUDA_VISIBLE_DEVICES": ",".join(str(i) for i in local_ids),
+            "NUM_GPUS": str(len(local_ids)),
+        }
+
+    async def _split_gpu_ids(self, gpu_ids: list[int]) -> tuple[list[int], list[int]]:
+        inventory = self._gpu_cache or await self.list_gpus()
+        by_index = {g["index"]: g for g in inventory}
+        missing = [i for i in gpu_ids if i not in by_index]
+        if missing:
+            raise RuntimeError(f"Unknown GPU ids: {missing}")
+        head: list[int] = []
+        worker: list[int] = []
+        for i in gpu_ids:
+            g = by_index[i]
+            local = int(g.get("local_index", i))
+            if g.get("role") == "worker":
+                worker.append(local)
+            else:
+                head.append(local)
+        return sorted(head), sorted(worker)
+
+    async def ensure_ray(
+        self,
+        head_devs: Optional[list[int]] = None,
+        worker_devs: Optional[list[int]] = None,
+    ) -> None:
         self.state = ClusterState.STARTING_RAY
         self.error = None
+        if head_devs is not None or worker_devs is not None:
+            await self.list_gpus()
+        head_extra = self._cuda_extra(head_devs, "head") if head_devs else None
+        worker_extra = self._cuda_extra(worker_devs, "worker") if worker_devs else None
+        pin_devices = bool(head_extra or worker_extra)
         snap = await self.ray_snapshot()
-        if snap.get("head_container") and snap.get("worker_container") and (
-            "2 node" in (snap.get("ray_status") or "") or "8.0" in (snap.get("ray_status") or "")
-        ):
-            self._append_log("Ray already up on both hosts")
+        ray_up = bool(
+            snap.get("head_container")
+            and (worker_devs == [] or snap.get("worker_container"))
+            and (
+                "2 node" in (snap.get("ray_status") or "")
+                or "1 node" in (snap.get("ray_status") or "")
+                or "GPU" in (snap.get("ray_status") or "")
+            )
+        )
+        if ray_up and not pin_devices:
+            self._append_log("Ray already up; GPU selection uses the full node(s)")
             return
-        self._append_log("starting Ray head")
-        env = self._node_exports()
+
         run = self._bash_script("run-ray-node.sh", self.settings.run_script)
+        stop = self._bash_script("stop-ray-node.sh", self.settings.stop_script)
+        if pin_devices and (snap.get("head_container") or snap.get("worker_container")):
+            self._append_log("restarting Ray so CUDA_VISIBLE_DEVICES matches the GPU selection")
+            await self._worker(stop, timeout=60)
+            await self._head(stop, timeout=60)
+
+        self._append_log("starting Ray head")
+        env = self._node_exports(head_extra)
         code, out = await self._head(f"{env} {run} head", timeout=90)
         self._append_log(out[-1500:])
         if code != 0:
@@ -246,15 +362,17 @@ class ClusterManager:
             self.error = f"Ray head failed: {out[-500:]}"
             raise RuntimeError(self.error)
 
-        self._append_log("starting Ray worker")
-        env = self._node_exports()
-        run = self._bash_script("run-ray-node.sh", self.settings.run_script)
-        code, out = await self._worker(f"{env} {run} worker", timeout=90)
-        self._append_log(out[-1500:])
-        if code != 0:
-            self.state = ClusterState.ERROR
-            self.error = f"Ray worker failed: {out[-500:]}"
-            raise RuntimeError(self.error)
+        if worker_devs == []:
+            self._append_log("no worker GPUs selected; single-node Ray")
+        else:
+            self._append_log("starting Ray worker")
+            env = self._node_exports(worker_extra)
+            code, out = await self._worker(f"{env} {run} worker", timeout=90)
+            self._append_log(out[-1500:])
+            if code != 0:
+                self.state = ClusterState.ERROR
+                self.error = f"Ray worker failed: {out[-500:]}"
+                raise RuntimeError(self.error)
 
         if self.settings.restrict_fabric:
             restrict = self._bash_script("restrict-fabric.sh", self.settings.restrict_script)
@@ -264,10 +382,14 @@ class ClusterManager:
         else:
             self._append_log("skipping fabric iptables (CLUSTER_RESTRICT_FABRIC=false)")
 
+        want_worker = worker_devs != []
         for _ in range(15):
             _, status = await self._head(f"docker exec {self.settings.container} ray status")
-            if "2 node" in status or "8.0/8.0 GPU" in status or "8.0 GPU" in status:
+            if want_worker and ("2 node" in status or "8.0/8.0 GPU" in status or "8.0 GPU" in status):
                 self._append_log("Ray cluster has 2 nodes")
+                return
+            if not want_worker and ("1 node" in status or "Active:" in status):
+                self._append_log("Ray head is up")
                 return
             await asyncio.sleep(2)
         self._append_log("Ray started; waiting for full GPU report")
@@ -281,9 +403,13 @@ class ClusterManager:
         served_model_name: Optional[str] = None,
         extra_args: Optional[list[str]] = None,
         trust_remote_code: bool = True,
+        gpu_ids: Optional[list[int]] = None,
     ) -> None:
         if not self.settings.enabled:
             raise RuntimeError("Cluster mode is disabled")
+        if await self._vllm_is_healthy():
+            await self._adopt_running()
+            raise RuntimeError("Cluster is already running")
         if self.state in {ClusterState.STARTING_RAY, ClusterState.STARTING_VLLM, ClusterState.RUNNING}:
             raise RuntimeError(f"Cluster is already {self.state.value}")
 
@@ -293,10 +419,17 @@ class ClusterManager:
         self.tensor_parallel_size = tensor_parallel_size
         self.pipeline_parallel_size = pipeline_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
+        self.gpu_ids = list(gpu_ids or [])
 
         if not self.settings.head_fabric or not self.settings.worker_fabric:
             raise RuntimeError("CLUSTER_HEAD_FABRIC and CLUSTER_WORKER_FABRIC must be set")
-        await self.ensure_ray()
+
+        head_devs = worker_devs = None
+        if gpu_ids:
+            head_devs, worker_devs = await self._split_gpu_ids(gpu_ids)
+            if not head_devs:
+                raise RuntimeError("Select at least one GPU on the Ray head; vLLM serve runs there")
+        await self.ensure_ray(head_devs=head_devs, worker_devs=worker_devs)
 
         model_path = model if model.startswith("/") else f"/models/{model}"
         serve = [
@@ -319,7 +452,7 @@ class ClusterManager:
         self.cmd = inner
         remote = (
             f"docker exec {self.settings.container} bash -lc "
-            f"{shlex.quote('pkill -f /usr/local/bin/vllm serve || true')}; "
+            f"{shlex.quote('pkill -f vllm.serve || true')}; "
             f"docker exec -d {self.settings.container} bash -lc {shlex.quote(inner)}"
         )
         self.state = ClusterState.STARTING_VLLM
@@ -381,6 +514,7 @@ class ClusterManager:
         )
         self.model = None
         self.cmd = None
+        self.gpu_ids = []
         self.state = ClusterState.STOPPED if self.settings.enabled else ClusterState.DISABLED
         if self._log_task:
             self._log_task.cancel()
@@ -435,7 +569,12 @@ class ClusterManager:
             gpus = fields.get("gpus", "0")
             add(label, "gpus", gpus.isdigit() and int(gpus) > 0, gpus)
             add(label, "models", fields.get("models") == "ok", s.models_dir)
-            add(label, "node_scripts", fields.get("script") == "ok", run)
+            add(
+                label,
+                "node_scripts",
+                fields.get("script") == "ok",
+                "$HOME/vllm_manager/cluster/run-ray-node.sh",
+            )
             add(
                 label,
                 "ray_image",
@@ -450,3 +589,93 @@ class ClusterManager:
 
         ok = all(c["ok"] for c in checks if c["name"] != "infiniband")
         return {"ok": ok, "checks": checks}
+
+    def _gpu_in_use(self, index: int) -> bool:
+        if self.state not in {
+            ClusterState.STARTING_RAY,
+            ClusterState.STARTING_VLLM,
+            ClusterState.RUNNING,
+        }:
+            return False
+        if self.gpu_ids:
+            return index in self.gpu_ids
+        return True
+
+    async def list_gpus(self) -> list[dict]:
+        """Read GPU inventory over SSH. The controller has no pynvml/GPUs."""
+        if not self.settings.enabled:
+            return []
+        now = time.monotonic()
+        if not (self._gpu_cache and now - self._gpu_cache_at < 2.0):
+            query = (
+                "nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,compute_cap "
+                "--format=csv,noheader,nounits"
+            )
+            gpus: list[dict] = []
+            offset = 0
+            for role, host in (("head", self.settings.head_host), ("worker", self.settings.worker_host)):
+                if not host:
+                    continue
+                code, out = await self._ssh(host, query, timeout=15)
+                parsed = 0
+                if code == 0:
+                    for line in out.splitlines():
+                        parts = [p.strip() for p in line.split(",")]
+                        if len(parts) < 5 or not parts[0].isdigit():
+                            continue
+                        local_idx = int(parts[0])
+                        try:
+                            total, used, free = (int(float(parts[i])) for i in (2, 3, 4))
+                        except ValueError:
+                            continue
+                        gpus.append({
+                            "index": offset + local_idx,
+                            "local_index": local_idx,
+                            "name": parts[1],
+                            "memory_total_mb": total,
+                            "memory_used_mb": used,
+                            "memory_free_mb": free,
+                            "compute_capability": parts[5] if len(parts) > 5 else "unknown",
+                            "source": "cluster",
+                            "host": host,
+                            "role": role,
+                        })
+                        parsed += 1
+                if parsed == 0:
+                    logger.warning("cluster GPU probe failed on %s (%s): %s", role, host, out[-200:])
+                offset += parsed if parsed else 4
+            self._gpu_cache = gpus
+            self._gpu_cache_at = time.monotonic()
+        annotated = []
+        for g in self._gpu_cache:
+            in_use = self._gpu_in_use(g["index"])
+            annotated.append({
+                **g,
+                "in_use": in_use,
+                "used_by": "cluster-ray" if in_use else None,
+                "selectable": not in_use,
+            })
+        return annotated
+
+    async def sync_model_to_worker(self, model_name: str) -> None:
+        """Copy a model directory from the head /models tree to the worker."""
+        if not self.settings.enabled or not self.settings.worker_host:
+            return
+        src = f"{self.settings.models_dir.rstrip('/')}/{model_name}"
+        user = self.settings.ssh_user
+        worker = self.settings.worker_host
+        rsync_ssh = (
+            "ssh -o BatchMode=yes -o IdentitiesOnly=yes -o LogLevel=ERROR "
+            "-o StrictHostKeyChecking=accept-new"
+        )
+        dest = f"{user}@{worker}:{src}/"
+        remote = (
+            f"mkdir -p {shlex.quote(src)} && "
+            f"rsync -a -e {shlex.quote(rsync_ssh)} "
+            f"{shlex.quote(src + '/')} {shlex.quote(dest)}"
+        )
+        self._append_log(f"syncing {model_name} to worker {worker}")
+        code, out = await self._head(remote, timeout=86400)
+        if code != 0:
+            raise RuntimeError(f"rsync to worker failed: {out[-500:]}")
+        self._append_log(f"synced {model_name} to worker")

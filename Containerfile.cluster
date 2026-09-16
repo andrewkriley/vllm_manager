@@ -9,7 +9,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         "httpx>=0.28.0" \
         "pydantic>=2.0.0" \
         "huggingface_hub>=0.26.0" \
+        "hf_transfer>=0.1.9" \
         "tqdm>=4.66.0"
+
+ENV HF_HUB_ENABLE_HF_TRANSFER=1
 
 COPY admin/ /app/admin/
 COPY entrypoint.sh /app/entrypoint.sh

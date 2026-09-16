@@ -160,7 +160,7 @@ Podman requires explicit device passthrough. The script auto-detects GPU devices
 Container (vllm-manager:latest)
 ├── Admin UI (FastAPI + uvicorn) — port 7080
 │   ├── GET  /           — Web UI
-│   ├── GET  /api/gpus   — GPU detection via pynvml
+│   ├── GET  /api/gpus   — local pynvml, or SSH nvidia-smi in cluster mode
 │   ├── GET  /api/models — Scan /models directory
 │   ├── GET  /api/status — All instance statuses
 │   ├── POST /api/start  — Launch vLLM subprocess
