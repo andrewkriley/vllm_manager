@@ -658,24 +658,35 @@ class ClusterManager:
         return annotated
 
     async def sync_model_to_worker(self, model_name: str) -> None:
-        """Copy a model directory from the head /models tree to the worker."""
+        """Copy a model directory from this controller's /models mount to the worker.
+
+        Uses the cluster SSH key in this container. Do not rsync from the head
+        host — that host's default key is not authorized for BatchMode to the worker.
+        """
         if not self.settings.enabled or not self.settings.worker_host:
             return
         src = f"{self.settings.models_dir.rstrip('/')}/{model_name}"
+        if not os.path.isdir(src):
+            raise RuntimeError(f"model directory missing on controller: {src}")
         user = self.settings.ssh_user
         worker = self.settings.worker_host
+        mkdir_code, mkdir_out = await self._worker(f"mkdir -p {shlex.quote(src)}", timeout=30)
+        if mkdir_code != 0:
+            raise RuntimeError(f"could not create {src} on worker: {mkdir_out[-300:]}")
         rsync_ssh = (
-            "ssh -o BatchMode=yes -o IdentitiesOnly=yes -o LogLevel=ERROR "
-            "-o StrictHostKeyChecking=accept-new"
+            f"ssh -i {shlex.quote(self.settings.ssh_key)} "
+            "-o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15 "
+            "-o LogLevel=ERROR -o StrictHostKeyChecking=accept-new"
         )
         dest = f"{user}@{worker}:{src}/"
-        remote = (
-            f"mkdir -p {shlex.quote(src)} && "
-            f"rsync -a -e {shlex.quote(rsync_ssh)} "
-            f"{shlex.quote(src + '/')} {shlex.quote(dest)}"
-        )
+        cmd = [
+            "rsync", "-a", "--info=stats2",
+            "-e", rsync_ssh,
+            src + "/",
+            dest,
+        ]
         self._append_log(f"syncing {model_name} to worker {worker}")
-        code, out = await self._head(remote, timeout=86400)
+        code, out = await self._run(cmd, timeout=86400)
         if code != 0:
             raise RuntimeError(f"rsync to worker failed: {out[-500:]}")
         self._append_log(f"synced {model_name} to worker")

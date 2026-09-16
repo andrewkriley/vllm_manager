@@ -18,7 +18,11 @@
 - [x] docker-compose.yml / podman-compose.yml
 - [x] Two-host Ray cluster mode (SSH + Docker Ray, not host pip)
 - [x] Cluster dependency preflight (`deploy/check-deps.sh`, `GET /api/cluster/preflight`)
+- [x] Cluster GPU selector shortcuts + auto PP=2 when both hosts are selected
+- [x] Worker rsync from the controller using the cluster SSH key (`rsync` in `Containerfile.cluster`)
+- [x] Gated Hugging Face probe (readable 401/403, not cache-miss)
 - [x] Health check endpoint for the admin container itself
+- [ ] Cluster stop without bouncing Ray can leak placement groups / actor handles; next Start may hit `ActorHandleNotFoundError` across Ray jobs. Workaround: `"ray": true` on stop, or recreate the Ray containers.
 - [ ] HTTPS support for admin UI
 
 ## UI Improvements

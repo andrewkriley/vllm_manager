@@ -126,7 +126,8 @@
   .progress-text { font-size: 0.82rem; color: var(--log-text); margin-top: 4px; }
 
   /* Buttons */
-  .btn-row { display: flex; gap: 10px; margin-top: 16px; }
+  .gpu-select-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
+  .gpu-select-actions button { font-size: 0.75rem; padding: 6px 10px; }
   button { padding: 10px 24px; border: none; border-radius: 6px; font-size: 0.9rem; font-weight: 500; cursor: pointer; transition: background 0.15s; }
   .btn-start { background: var(--green); color: #fff; }
   .btn-start:hover { background: var(--green-hover); }
@@ -243,7 +244,15 @@
     <div class="warning" id="gpu-warning"></div>
     <p id="gpu-select-hint" style="font-size:0.85rem;color:var(--text-secondary);margin:0 0 10px">
       Tick GPUs, then Start Instance. In cluster mode this starts the two-host Ray replica (serve runs on the head).
+      Selecting GPUs on both hosts sets Pipeline Parallel to 2 (tensor parallel stays inside each host).
     </p>
+    <div class="gpu-select-actions" id="gpu-select-actions">
+      <button class="btn-refresh" type="button" onclick="selectGpus('all')">Select all</button>
+      <button class="btn-refresh" type="button" onclick="selectGpus('half')">50% both hosts</button>
+      <button class="btn-refresh" type="button" onclick="selectGpus('head')">All on host 1 (head)</button>
+      <button class="btn-refresh" type="button" onclick="selectGpus('worker')">All on host 2 (worker)</button>
+      <button class="btn-refresh" type="button" onclick="selectGpus('none')">Clear</button>
+    </div>
     <div class="gpu-list" id="gpu-list">Loading...</div>
   </div>
 
@@ -283,7 +292,7 @@
       <option value="vllm">vllm (force native only)</option>
     </select>
 
-    <label>Pipeline Parallel Size (default 1 = off)</label>
+    <label>Pipeline Parallel Size (1 = one host; auto 2 if both hosts are selected)</label>
     <input type="number" id="pp-size" value="1" min="1" max="8"
            onchange="onPpChanged()">
     <div id="pp-partition-row" style="display:none">
@@ -570,22 +579,67 @@ function renderGpus() {
   list.querySelectorAll('input:not(:disabled)').forEach(cb => cb.addEventListener('change', checkMixedArch));
 }
 
+function gpuCheckboxes(includeDisabled = false) {
+  return [...document.querySelectorAll('#gpu-list input[type="checkbox"]')]
+    .filter(cb => includeDisabled || !cb.disabled);
+}
+
+function selectGpus(mode) {
+  const boxes = gpuCheckboxes();
+  boxes.forEach(cb => { cb.checked = false; });
+  const byRole = (role) => boxes
+    .filter(cb => (cb.dataset.role || '') === role)
+    .sort((a, b) => parseInt(a.value, 10) - parseInt(b.value, 10));
+  const head = byRole('head');
+  const worker = byRole('worker');
+  if (mode === 'all') {
+    boxes.forEach(cb => { cb.checked = true; });
+  } else if (mode === 'none') {
+    /* already cleared */
+  } else if (mode === 'half') {
+    const groups = (head.length || worker.length) ? [head, worker] : [boxes];
+    groups.forEach(group => {
+      const n = Math.floor(group.length / 2);
+      group.slice(0, n).forEach(cb => { cb.checked = true; });
+    });
+  } else if (mode === 'head') {
+    (head.length ? head : boxes).forEach(cb => { cb.checked = true; });
+  } else if (mode === 'worker') {
+    worker.forEach(cb => { cb.checked = true; });
+  }
+  onGpuSelectionChange();
+}
+
 function onGpuSelectionChange() {
-  checkMixedArch();
-  updatePpPartition();
   const checked = [...document.querySelectorAll('#gpu-list input:checked')];
-  const warn = $('gpu-warning');
-  if (!checked.length) return;
+  const ppInput = $('pp-size');
   const roles = new Set(checked.map(cb => cb.dataset.role).filter(Boolean));
-  const pp = parseInt($('pp-size').value) || 1;
-  const tp = Math.max(1, Math.floor(checked.length / pp));
-  if ($('cluster-tp')) $('cluster-tp').value = tp;
-  if ($('cluster-pp')) $('cluster-pp').value = pp;
-  if ($('cluster-mem')) $('cluster-mem').value = $('mem-util').value;
-  if (roles.size === 2 && pp === 1) {
-    warn.textContent = 'Two hosts selected with Pipeline Parallel = 1 (TP=' + checked.length + '). For the usual 4+4 layout set Pipeline Parallel Size to 2.';
+  const crossHost = roles.has('head') && roles.has('worker');
+
+  if (checked.length && ppInput) {
+    if (crossHost) {
+      ppInput.value = '2';
+    } else {
+      ppInput.value = '1';
+    }
+    onPpChanged();
+  }
+
+  const pp = parseInt(ppInput && ppInput.value) || 1;
+  const tp = Math.max(1, Math.floor(checked.length / Math.max(pp, 1)));
+  if ($('cluster-tp')) $('cluster-tp').value = String(tp);
+  if ($('cluster-pp')) $('cluster-pp').value = String(pp);
+  if ($('cluster-mem') && $('mem-util')) $('cluster-mem').value = $('mem-util').value;
+
+  checkMixedArch();
+  const warn = $('gpu-warning');
+  if (warn && warn.style.display !== 'block' && crossHost && checked.length % pp !== 0) {
+    warn.textContent =
+      'Both hosts are selected so Pipeline Parallel is 2, but ' +
+      checked.length + ' GPUs is not divisible by 2. Tick an even number (same count per host).';
     warn.style.display = 'block';
   }
+  updatePpPartition();
 }
 
 function checkMixedArch() {
@@ -1007,7 +1061,7 @@ async function loadDownloadConfig() {
     if (!hint) return;
     const bits = [];
     if (d.has_server_token) bits.push('Server already has HF_TOKEN/HF_API — leave the field blank to use it.');
-    else bits.push('No server token configured. Paste a token for gated or faster downloads.');
+    else bits.push('No server token configured. Gated models (Llama 3.1 405B) will fail until you paste a token.');
     if (d.cluster_sync) bits.push('After download, the snapshot is copied to the worker host.');
     hint.textContent = bits.join(' ');
   } catch (e) {}

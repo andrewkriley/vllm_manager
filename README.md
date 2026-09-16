@@ -178,7 +178,9 @@ Each vLLM instance runs as a subprocess managed by the admin backend. GPU isolat
 
 ### Two-host Ray cluster mode
 
-Optional second mode: the admin process **does not** take GPUs. It SSHs to two GPU hosts, starts Docker Ray, then `vllm serve` on the head with `--distributed-executor-backend ray`.
+Optional second mode (this branch): the admin process **does not** take GPUs. It SSHs to two GPU hosts, starts Docker Ray, then `vllm serve` on the head with `--distributed-executor-backend ray`. Fabric IPs, NIC names, and HCA lists stay in `.env` — nothing about a specific lab is hardcoded.
+
+This is a **CPU controller + GPU Docker** layout. It is not the same as in-container `CLUSTER_MODE` / `ADMIN_ROLE=manager|worker` (Ray inside the admin image on every box). Use this path when Ubuntu must stay free of `pip` vLLM/Ray and the admin UI must not consume GPUs.
 
 **Ray is not installed on Ubuntu.** Official `vllm/vllm-openai` also has no `ray` CLI. The node image is `cluster/Dockerfile.ray` (`pip install ray[cgraph]` inside Docker).
 
@@ -222,12 +224,34 @@ bash run-cluster-controller.sh
 | `POST /api/cluster/start` | Ensure Ray, then `vllm serve` on the head |
 | `POST /api/cluster/stop` | `{ "ray": false }` stops serve only; `true` also stops Ray |
 
+#### GPU selection and parallelism
+
+The cluster GPU list comes from SSH `nvidia-smi` (not `pynvml` in the slim controller). Shortcuts: **Select all**, **50% both hosts**, **All on host 1 (head)**, **All on host 2 (worker)**, **Clear**.
+
+Selecting GPUs on **both** hosts sets pipeline parallel to **2** and tensor parallel to `gpu_count / 2` (typical layout: TP inside each host over NVLink, PP across hosts over the fabric). Selecting GPUs on a single host sets PP back to 1. Override the fields before Start if you need something else. Prefer even GPU counts when both hosts are ticked.
+
+Do not start with TP equal to the full cluster GPU count across hosts unless you have already proven that path on your fabric.
+
+#### Model download and worker rsync
+
+There is no shared NFS in this mode. Hub downloads write to `MODELS_DIR/<repo-name>` on the **controller** (same path must exist on both GPU hosts). After Hub files land, the controller **rsyncs** that directory to the worker.
+
+Rsync runs **inside** `vllm-manager` with `-i $CLUSTER_SSH_KEY`. Do not rsync from the GPU head host using the default user key — IdentitiesOnly BatchMode to the worker will fail with `Permission denied (publickey)`. `Containerfile.cluster` installs `openssh-client` and `rsync`.
+
+Gated Hub repos (Llama, etc.) need a token: UI field, or `HF_TOKEN` / `HF_API` in the controller env. Fine-grained tokens must include **Read access to contents of all public gated repos you can access**, and the token’s account must have accepted the model license. The download path probes Hub access before `snapshot_download` so 401/403 is not reported as a cache/offline miss. Tokens are never written to git, argv, or logs.
+
+#### Restarting a replica
+
+`POST /api/cluster/stop` with `"ray": false` only `pkill`s `vllm serve`. Ray placement groups can stay reserved. A later Start then runs a **new Ray job** against leftover actor handles (`ActorHandleNotFoundError`: handle created in job `N`, current job `N+1`).
+
+If Start after Stop dies during engine init, stop **with Ray** (`"ray": true`) or recreate the Ray containers, then Start again. Rebuilding the admin container does not bounce Ray.
+
 ## Project Structure
 
 ```
 ├── cluster/               # two-host Ray node scripts + Dockerfile.ray
 ├── deploy/check-deps.sh   # SSH/Docker/GPU/Ray-image preflight
-├── Containerfile.cluster  # admin UI without GPUs
+├── Containerfile.cluster  # CPU admin UI (ssh + rsync, no GPUs)
 ├── run-cluster-controller.sh
 ├── .env.example           # Configuration template
 ├── build.sh               # Build the container image

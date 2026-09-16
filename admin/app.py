@@ -33,6 +33,7 @@ _download_state = {
     "error": None,
     "downloaded_bytes": 0,
     "total_bytes": 0,
+    "using_token": False,
 }
 
 MODELS_DIR = Path(os.getenv("MODELS_DIR", "/models"))
@@ -548,6 +549,79 @@ def _redact_token(message: str, token: Optional[str]) -> str:
     return message
 
 
+def _hub_error_types():
+    try:
+        from huggingface_hub.errors import GatedRepoError, HfHubHTTPError, RepositoryNotFoundError
+    except ImportError:  # older huggingface_hub
+        from huggingface_hub.utils import GatedRepoError, HfHubHTTPError, RepositoryNotFoundError
+    return GatedRepoError, HfHubHTTPError, RepositoryNotFoundError
+
+
+def _gated_help(repo_id: str, has_token: bool, detail: str = "") -> str:
+    license_url = f"https://huggingface.co/{repo_id}"
+    tokens_url = "https://huggingface.co/settings/tokens"
+    text = (detail or "").lower()
+    if "public gated repositories" in text or "fine-grained token" in text:
+        return (
+            f"{repo_id} is gated and this Hugging Face token is fine-grained without "
+            "gated-repo read permission. Edit the token at "
+            f"{tokens_url} and enable “Read access to contents of all public gated repos "
+            f"you can access”, then accept the license at {license_url}."
+        )
+    if not has_token:
+        return (
+            f"{repo_id} is gated. The Hub is reachable; LICENSE/README are public but "
+            "weight files need a token. Paste an HF token in the UI (or set HF_TOKEN/HF_API "
+            f"on the server) and accept the license at {license_url}. Fine-grained tokens "
+            "must include “Read access to contents of all public gated repos you can access” "
+            f"({tokens_url})."
+        )
+    return (
+        f"This token cannot read gated files in {repo_id}. On Hugging Face, with the same "
+        f"account as the token: accept the license at {license_url}. If the token is "
+        "fine-grained, enable “Read access to contents of all public gated repos you can access” "
+        f"at {tokens_url}."
+    )
+
+
+def _probe_hub_access(repo_id: str, token: Optional[str]) -> None:
+    """Fail fast with a readable error before snapshot_download wraps 401/403 as “no internet”."""
+    from huggingface_hub import HfApi
+
+    GatedRepoError, HfHubHTTPError, RepositoryNotFoundError = _hub_error_types()
+    api = HfApi(token=token)
+    try:
+        info = api.model_info(repo_id)
+    except RepositoryNotFoundError as e:
+        raise RuntimeError(
+            f"Repo not found or not visible: {repo_id}. Check the id, or authenticate if it is private."
+        ) from e
+    except GatedRepoError as e:
+        raise RuntimeError(_gated_help(repo_id, bool(token), str(e))) from e
+    except HfHubHTTPError as e:
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        if code in (401, 403):
+            raise RuntimeError(_gated_help(repo_id, bool(token), str(e))) from e
+        raise RuntimeError(_redact_token(str(e), token)) from e
+
+    gated = getattr(info, "gated", False)
+    if gated and not token:
+        raise RuntimeError(_gated_help(repo_id, False))
+
+    try:
+        from huggingface_hub import auth_check
+    except ImportError:
+        return
+    try:
+        auth_check(repo_id, repo_type="model", token=token)
+    except Exception as e:
+        name = type(e).__name__
+        if name in {"GatedRepoError", "HfHubHTTPError", "LocalEntryNotFoundError"} or "401" in str(e) or "403" in str(e):
+            raise RuntimeError(_gated_help(repo_id, bool(token), str(e))) from e
+        if name == "RepositoryNotFoundError":
+            raise RuntimeError(f"Repo not found or not visible: {repo_id}") from e
+
+
 def _do_download(repo_id: str, token: Optional[str]) -> None:
     """Blocking download — runs in a thread via asyncio."""
     from huggingface_hub import snapshot_download
@@ -570,7 +644,8 @@ def _do_download(repo_id: str, token: Optional[str]) -> None:
     if not local_dir:
         raise ValueError(f"Invalid repo ID: {repo_id}")
 
-    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+    _probe_hub_access(repo_id, token)
+    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
     snapshot_download(
         repo_id,
         local_dir=str(local_dir),
@@ -588,6 +663,7 @@ async def _run_download(repo_id: str, token: Optional[str], sync_to_worker: bool
     _download_state["phase"] = "huggingface"
     _download_state["downloaded_bytes"] = 0
     _download_state["total_bytes"] = 0
+    _download_state["using_token"] = bool(token)
     try:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, _do_download, repo_id, token)
@@ -599,9 +675,12 @@ async def _run_download(repo_id: str, token: Optional[str], sync_to_worker: bool
         _download_state["phase"] = "done"
         logger.info("Download complete: %s", repo_id)
     except Exception as e:
+        msg = _redact_token(str(e), token)
+        if "cannot find the requested files in the local cache" in msg.lower():
+            msg = _gated_help(repo_id, bool(token), msg)
         _download_state["status"] = "error"
-        _download_state["error"] = _redact_token(str(e), token)
-        logger.error("Download failed: %s", _redact_token(str(e), token))
+        _download_state["error"] = msg
+        logger.error("Download failed: %s", msg)
 
 
 @app.get("/api/download/config")
