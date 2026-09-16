@@ -207,6 +207,11 @@ def api_status():
     return {"instances": instances}
 
 
+@app.get("/api/health")
+def api_health():
+    return {"status": "healthy", "service": "vllm-manager", "cluster_enabled": _cluster.settings.enabled}
+
+
 @app.get("/api/cluster/config")
 def api_cluster_config():
     return _cluster.public_config()
@@ -217,6 +222,13 @@ async def api_cluster_status():
     status = _cluster.get_status()
     status["ray"] = await _cluster.ray_snapshot()
     return status
+
+
+@app.get("/api/cluster/preflight")
+async def api_cluster_preflight():
+    if not _cluster.settings.enabled:
+        return JSONResponse(status_code=400, content={"error": "CLUSTER_ENABLED is not set"})
+    return await _cluster.preflight()
 
 
 class ClusterStartRequest(BaseModel):

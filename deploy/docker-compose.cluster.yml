@@ -1,0 +1,22 @@
+# Admin UI only. GPU Ray nodes are started over SSH, not by this compose file.
+# From repo root: docker compose -f deploy/docker-compose.cluster.yml up -d --build
+services:
+  vllm-manager:
+    image: vllm-manager-cluster:latest
+    build:
+      context: ..
+      dockerfile: Containerfile.cluster
+    container_name: vllm-manager
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${ADMIN_PORT:-7080}:7080"
+    env_file:
+      - ../.env
+    environment:
+      CLUSTER_SSH_KEY: /keys/vllm_manager_ed25519
+      MODELS_DIR: /models
+    volumes:
+      - ${MODELS_DIR:-/models}:/models:ro
+      - ${CLUSTER_SSH_KEY_HOST:-${HOME}/.ssh/vllm_manager_ed25519}:/keys/vllm_manager_ed25519:ro

@@ -329,6 +329,10 @@
       Does not use <code>CUDA_VISIBLE_DEVICES</code> in this admin process.
     </p>
     <pre id="cluster-ray-status" style="background:var(--bg-logs);padding:10px;border-radius:6px;font-size:0.78rem;max-height:140px;overflow:auto;color:var(--log-text)">Loading cluster…</pre>
+    <pre id="cluster-preflight" style="background:var(--bg-logs);padding:10px;border-radius:6px;font-size:0.78rem;max-height:160px;overflow:auto;color:var(--log-text);margin-top:8px">Checking dependencies…</pre>
+    <div class="btn-row">
+      <button class="btn-refresh" onclick="refreshClusterCard()">Refresh deps</button>
+    </div>
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
       <div>
         <label>Tensor parallel</label>
@@ -1165,6 +1169,12 @@ async function refreshClusterCard() {
       '\nhead: ' + ((st.ray && st.ray.head_container) || 'down') +
       '\nworker: ' + ((st.ray && st.ray.worker_container) || 'down') +
       (ray ? '\n' + ray : '');
+    const pfRes = await fetch('/api/cluster/preflight');
+    const pf = await pfRes.json();
+    if (pf.checks) {
+      $('cluster-preflight').textContent = (pf.ok ? 'deps: PASS\n' : 'deps: FAIL\n') +
+        pf.checks.map(c => (c.ok ? '[ok]  ' : '[FAIL] ') + c.host + ' ' + c.name + (c.detail ? ' — ' + c.detail : '')).join('\n');
+    }
   } catch (e) {
     $('cluster-card').style.display = 'none';
   }

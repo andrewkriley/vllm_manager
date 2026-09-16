@@ -15,7 +15,10 @@
 - [ ] Model search from HuggingFace Hub in the UI
 - [ ] Instance naming (custom names instead of instance-1, instance-2)
 - [ ] API key / basic auth for the admin UI
-- [ ] docker-compose.yml / podman-compose.yml
+- [x] docker-compose.yml / podman-compose.yml
+- [x] Two-host Ray cluster mode (SSH + Docker Ray, not host pip)
+- [x] Cluster dependency preflight (`deploy/check-deps.sh`, `GET /api/cluster/preflight`)
+- [x] Health check endpoint for the admin container itself
 - [ ] HTTPS support for admin UI
 
 ## UI Improvements
@@ -32,6 +35,6 @@
 
 - [ ] Add unit tests for vllm_manager.py
 - [ ] Add integration tests for API endpoints
-- [ ] Health check endpoint for the admin container itself
+- [x] Health check endpoint for the admin container itself
 - [ ] Structured JSON logging
 - [ ] Rate limiting on download endpoint

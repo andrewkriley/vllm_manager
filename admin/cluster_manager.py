@@ -45,21 +45,23 @@ class ClusterSettings:
     head_fabric: str = field(default_factory=lambda: os.getenv("CLUSTER_HEAD_FABRIC", ""))
     worker_fabric: str = field(default_factory=lambda: os.getenv("CLUSTER_WORKER_FABRIC", ""))
     container: str = field(default_factory=lambda: os.getenv("CLUSTER_CONTAINER", "vllm-ray"))
-    run_script: str = field(
-        default_factory=lambda: os.getenv(
-            "CLUSTER_RUN_SCRIPT", "/home/andreril/aipod/docker/run-cluster.sh"
-        )
+    scripts_dir: str = field(
+        default_factory=lambda: os.getenv("CLUSTER_SCRIPTS_DIR", "$HOME/vllm_manager/cluster")
     )
-    stop_script: str = field(
-        default_factory=lambda: os.getenv(
-            "CLUSTER_STOP_SCRIPT", "/home/andreril/aipod/docker/stop-cluster.sh"
-        )
+    vllm_image: str = field(
+        default_factory=lambda: os.getenv("VLLM_IMAGE", "vllm-manager-ray:latest")
     )
-    restrict_script: str = field(
-        default_factory=lambda: os.getenv(
-            "CLUSTER_RESTRICT_SCRIPT", "/home/andreril/aipod/scripts/restrict-fabric.sh"
-        )
-    )
+    models_dir: str = field(default_factory=lambda: os.getenv("MODELS_DIR", "/models"))
+    nccl_socket_ifname: str = field(default_factory=lambda: os.getenv("NCCL_SOCKET_IFNAME", ""))
+    nccl_ib_hca: str = field(default_factory=lambda: os.getenv("NCCL_IB_HCA", ""))
+    nccl_ib_gid_index: str = field(default_factory=lambda: os.getenv("NCCL_IB_GID_INDEX", ""))
+    nccl_net_gdr_level: str = field(default_factory=lambda: os.getenv("NCCL_NET_GDR_LEVEL", ""))
+    fabric_cidr: str = field(default_factory=lambda: os.getenv("FABRIC_CIDR", ""))
+    restrict_fabric: bool = field(default_factory=lambda: _env_bool("CLUSTER_RESTRICT_FABRIC", True))
+    num_gpus: str = field(default_factory=lambda: os.getenv("NUM_GPUS", ""))
+    run_script: str = field(default_factory=lambda: os.getenv("CLUSTER_RUN_SCRIPT", ""))
+    stop_script: str = field(default_factory=lambda: os.getenv("CLUSTER_STOP_SCRIPT", ""))
+    restrict_script: str = field(default_factory=lambda: os.getenv("CLUSTER_RESTRICT_SCRIPT", ""))
     serve_host: str = field(default_factory=lambda: os.getenv("CLUSTER_SERVE_HOST", "0.0.0.0"))
     serve_port: int = field(default_factory=lambda: int(os.getenv("CLUSTER_API_PORT", "8000")))
     health_url: str = field(
@@ -131,6 +133,34 @@ class ClusterManager:
     async def _worker(self, remote: str, timeout: float = 120) -> tuple[int, str]:
         return await self._ssh(self.settings.worker_host, remote, timeout=timeout)
 
+    def _resolved_script(self, filename: str, override: str) -> str:
+        if override:
+            return override
+        return f"{self.settings.scripts_dir.rstrip('/')}/{filename}"
+
+    def _bash_script(self, filename: str, override: str) -> str:
+        path = self._resolved_script(filename, override)
+        if path.startswith("$") or path.startswith("~"):
+            return f"bash {path}"
+        return f"bash {shlex.quote(path)}"
+
+    def _node_exports(self) -> str:
+        s = self.settings
+        vals = {
+            "VLLM_HEAD_IP": s.head_fabric,
+            "VLLM_WORKER_IP": s.worker_fabric,
+            "VLLM_IMAGE": s.vllm_image,
+            "VLLM_CONTAINER": s.container,
+            "VLLM_MODELS_DIR": s.models_dir,
+            "NCCL_SOCKET_IFNAME": s.nccl_socket_ifname,
+            "NCCL_IB_HCA": s.nccl_ib_hca,
+            "NCCL_IB_GID_INDEX": s.nccl_ib_gid_index,
+            "NCCL_NET_GDR_LEVEL": s.nccl_net_gdr_level,
+            "FABRIC_CIDR": s.fabric_cidr,
+            "NUM_GPUS": s.num_gpus,
+        }
+        return " ".join(f"{k}={shlex.quote(v)}" for k, v in vals.items() if v)
+
     def public_config(self) -> dict:
         s = self.settings
         return {
@@ -143,6 +173,8 @@ class ClusterManager:
             "serve_host": s.serve_host,
             "serve_port": s.serve_port,
             "public_api": s.public_api,
+            "scripts_dir": s.scripts_dir,
+            "vllm_image": s.vllm_image,
             "defaults": {
                 "tensor_parallel_size": 4,
                 "pipeline_parallel_size": 2,
@@ -205,7 +237,9 @@ class ClusterManager:
             self._append_log("Ray already up on both hosts")
             return
         self._append_log("starting Ray head")
-        code, out = await self._head(f"bash {shlex.quote(self.settings.run_script)} head", timeout=90)
+        env = self._node_exports()
+        run = self._bash_script("run-ray-node.sh", self.settings.run_script)
+        code, out = await self._head(f"{env} {run} head", timeout=90)
         self._append_log(out[-1500:])
         if code != 0:
             self.state = ClusterState.ERROR
@@ -213,15 +247,22 @@ class ClusterManager:
             raise RuntimeError(self.error)
 
         self._append_log("starting Ray worker")
-        code, out = await self._worker(f"bash {shlex.quote(self.settings.run_script)} worker", timeout=90)
+        env = self._node_exports()
+        run = self._bash_script("run-ray-node.sh", self.settings.run_script)
+        code, out = await self._worker(f"{env} {run} worker", timeout=90)
         self._append_log(out[-1500:])
         if code != 0:
             self.state = ClusterState.ERROR
             self.error = f"Ray worker failed: {out[-500:]}"
             raise RuntimeError(self.error)
 
-        code, out = await self._head(f"bash {shlex.quote(self.settings.restrict_script)}", timeout=30)
-        self._append_log(out[-500:] or "fabric iptables ok")
+        if self.settings.restrict_fabric:
+            restrict = self._bash_script("restrict-fabric.sh", self.settings.restrict_script)
+            env = self._node_exports()
+            code, out = await self._head(f"{env} {restrict}", timeout=30)
+            self._append_log(out[-500:] or "fabric iptables ok")
+        else:
+            self._append_log("skipping fabric iptables (CLUSTER_RESTRICT_FABRIC=false)")
 
         for _ in range(15):
             _, status = await self._head(f"docker exec {self.settings.container} ray status")
@@ -253,6 +294,8 @@ class ClusterManager:
         self.pipeline_parallel_size = pipeline_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
 
+        if not self.settings.head_fabric or not self.settings.worker_fabric:
+            raise RuntimeError("CLUSTER_HEAD_FABRIC and CLUSTER_WORKER_FABRIC must be set")
         await self.ensure_ray()
 
         model_path = model if model.startswith("/") else f"/models/{model}"
@@ -346,9 +389,64 @@ class ClusterManager:
 
     async def stop_ray(self) -> None:
         await self.stop_serve()
+        stop = self._bash_script("stop-ray-node.sh", self.settings.stop_script)
         self._append_log("stopping Ray worker")
-        await self._worker(f"bash {shlex.quote(self.settings.stop_script)}", timeout=60)
+        await self._worker(stop, timeout=60)
         self._append_log("stopping Ray head")
-        await self._head(f"bash {shlex.quote(self.settings.stop_script)}", timeout=60)
+        await self._head(stop, timeout=60)
         self.state = ClusterState.STOPPED if self.settings.enabled else ClusterState.DISABLED
         self._append_log("Ray cluster stopped")
+
+    async def preflight(self) -> dict:
+        """SSH both hosts and report Ray/SSH/Docker/GPU/image readiness."""
+        checks: list[dict] = []
+
+        def add(host: str, name: str, ok: bool, detail: str = "") -> None:
+            checks.append({"host": host, "name": name, "ok": ok, "detail": detail})
+
+        s = self.settings
+        if not s.enabled:
+            add("controller", "CLUSTER_ENABLED", False, "set CLUSTER_ENABLED=true")
+            return {"ok": False, "checks": checks}
+        add("controller", "CLUSTER_ENABLED", True)
+        add("controller", "head_host", bool(s.head_host), s.head_host)
+        add("controller", "worker_host", bool(s.worker_host), s.worker_host)
+        add("controller", "head_fabric", bool(s.head_fabric), s.head_fabric)
+        add("controller", "worker_fabric", bool(s.worker_fabric), s.worker_fabric)
+        add("controller", "ssh_key", os.path.exists(s.ssh_key), s.ssh_key)
+
+        probe = (
+            "set +e; "
+            "echo docker=$(docker info >/dev/null 2>&1 && echo ok || echo FAIL); "
+            "echo gpus=$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' '); "
+            f"echo models=$(test -d {shlex.quote(s.models_dir)} && echo ok || echo FAIL); "
+            "echo script=$(test -x $HOME/vllm_manager/cluster/run-ray-node.sh && echo ok || echo FAIL); "
+            f"echo image=$(docker image inspect {shlex.quote(s.vllm_image)} >/dev/null 2>&1 && echo ok || echo missing); "
+            "echo ib=$(test -d /dev/infiniband && echo yes || echo no)"
+        )
+        for label, host in (("head", s.head_host), ("worker", s.worker_host)):
+            if not host:
+                add(label, "ssh", False, "host not configured")
+                continue
+            code, out = await self._ssh(host, probe, timeout=25)
+            add(label, "ssh", code == 0, out[-200:] if code != 0 else "")
+            fields = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+            add(label, "docker", fields.get("docker") == "ok", "")
+            gpus = fields.get("gpus", "0")
+            add(label, "gpus", gpus.isdigit() and int(gpus) > 0, gpus)
+            add(label, "models", fields.get("models") == "ok", s.models_dir)
+            add(label, "node_scripts", fields.get("script") == "ok", run)
+            add(
+                label,
+                "ray_image",
+                fields.get("image") == "ok",
+                "Ray must be in the Docker image, not apt/pip on the host" if fields.get("image") != "ok" else s.vllm_image,
+            )
+            add(label, "infiniband", True, fields.get("ib", "unknown"))
+
+        if s.head_fabric and s.worker_fabric and s.head_host:
+            code, _ = await self._head(f"ping -c 1 -W 2 {shlex.quote(s.worker_fabric)} >/dev/null")
+            add("fabric", "head_to_worker_ping", code == 0, s.worker_fabric)
+
+        ok = all(c["ok"] for c in checks if c["name"] != "infiniband")
+        return {"ok": ok, "checks": checks}

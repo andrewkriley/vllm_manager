@@ -1,0 +1,6 @@
+# Ray lives in this image, not on the Ubuntu host.
+# Official vllm/vllm-openai does not ship the `ray` CLI.
+ARG VLLM_BASE_IMAGE=vllm/vllm-openai:latest
+FROM ${VLLM_BASE_IMAGE}
+USER root
+RUN pip install --no-cache-dir "ray[cgraph]"

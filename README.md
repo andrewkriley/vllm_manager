@@ -178,17 +178,46 @@ Each vLLM instance runs as a subprocess managed by the admin backend. GPU isolat
 
 ### Two-host Ray cluster mode
 
-Optional second mode for a lab that already has Docker Ray on two hosts (fabric IPs, `run-cluster.sh`). The admin process **does not** take GPUs. It SSHs to head and worker, starts Ray, then `vllm serve` inside the head container with `--distributed-executor-backend ray`.
+Optional second mode: the admin process **does not** take GPUs. It SSHs to two GPU hosts, starts Docker Ray, then `vllm serve` on the head with `--distributed-executor-backend ray`.
+
+**Ray is not installed on Ubuntu.** Official `vllm/vllm-openai` also has no `ray` CLI. The node image is `cluster/Dockerfile.ray` (`pip install ray[cgraph]` inside Docker).
+
+#### Dependency matrix
+
+| Component | Where it runs | Notes |
+|---|---|---|
+| Admin UI | CPU Docker (`Containerfile.cluster`) | SSH client, FastAPI, port 7080 |
+| SSH | Controller → head and worker | Dedicated key, `BatchMode`, user in `docker` group |
+| Docker + NVIDIA Container Toolkit | Both GPU hosts | `--gpus all` |
+| `nvidia-smi` / driver | Both GPU hosts | Do not `pip install` vLLM/Ray on the host |
+| Ray | Inside `VLLM_IMAGE` only | `cluster/build-ray-image.sh` on each host |
+| Node scripts | `~/vllm_manager/cluster` on each host | `cluster/install-node.sh user@host` |
+| Models | `MODELS_DIR` (default `/models`) on **both** hosts | Same snapshot path |
+| Fabric IPs | `CLUSTER_HEAD_FABRIC` / `CLUSTER_WORKER_FABRIC` | Ray GCS + NCCL, not the management NIC |
+| NCCL / IB | Optional | `NCCL_SOCKET_IFNAME`, `NCCL_IB_HCA`; `--privileged` if `ibv_open_device` needs it |
+| iptables fabric lock | Optional | Passwordless sudo; `CLUSTER_RESTRICT_FABRIC` |
+
+#### Deploy
 
 ```bash
-# On the head host, once a dedicated SSH key exists at ~/.ssh/vllm_manager_ed25519
+cp .env.example .env   # set CLUSTER_* , fabric IPs, VLLM_IMAGE
+bash deploy/check-deps.sh
+
+# once per GPU host
+bash cluster/install-node.sh "$CLUSTER_SSH_USER@$CLUSTER_HEAD_HOST"
+bash cluster/install-node.sh "$CLUSTER_SSH_USER@$CLUSTER_WORKER_HOST"
+ssh "$CLUSTER_SSH_USER@$CLUSTER_HEAD_HOST" 'cd ~/vllm_manager/cluster && bash build-ray-image.sh'
+ssh "$CLUSTER_SSH_USER@$CLUSTER_WORKER_HOST" 'cd ~/vllm_manager/cluster && bash build-ray-image.sh'
+
 bash run-cluster-controller.sh
-# UI: http://<head-mgmt>:7080  — use “Start cluster replica”
+# UI: http://<head-mgmt>:7080  — Start cluster replica
 ```
 
 | Endpoint | Role |
 |---|---|
+| `GET /api/health` | Admin container liveness |
 | `GET /api/cluster/config` | Whether cluster mode is enabled |
+| `GET /api/cluster/preflight` | SSH/Docker/GPU/Ray-image/script checks |
 | `GET /api/cluster/status` | Ray containers + vLLM state |
 | `POST /api/cluster/start` | Ensure Ray, then `vllm serve` on the head |
 | `POST /api/cluster/stop` | `{ "ray": false }` stops serve only; `true` also stops Ray |
@@ -196,7 +225,10 @@ bash run-cluster-controller.sh
 ## Project Structure
 
 ```
-├── Containerfile          # Image definition (extends vllm/vllm-openai)
+├── cluster/               # two-host Ray node scripts + Dockerfile.ray
+├── deploy/check-deps.sh   # SSH/Docker/GPU/Ray-image preflight
+├── Containerfile.cluster  # admin UI without GPUs
+├── run-cluster-controller.sh
 ├── .env.example           # Configuration template
 ├── build.sh               # Build the container image
 ├── run.sh                 # Start the container
